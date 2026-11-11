@@ -2,12 +2,12 @@
 {
   "name": "instaflow-bot",
   "version": "1.0.0",
-  "description": "Instagram Downloader Telegram Bot",
+  "description": "Instagram Video Downloader Telegram Bot",
   "main": "api/webhook.js",
   "scripts": {
     "start": "node api/webhook.js"
   },
   "engines": {
-    "node": "20.x"
+    "node": "26.x"
   }
 }
