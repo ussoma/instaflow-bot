@@ -2,6 +2,9 @@
 const TOKEN = process.env.BOT_TOKEN;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const RAPIDAPI_KEY = process.env.RAPIDAPI_KEY;
+
+const RAPIDAPI_HOST = "instagram-reels-downloader-api.p.rapidapi.com";
 
 async function telegram(method, body) {
   const response = await fetch(
@@ -42,8 +45,8 @@ async function registerUser(user) {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "apikey": SUPABASE_KEY,
-        "Authorization": `Bearer ${SUPABASE_KEY}`
+        apikey: SUPABASE_KEY,
+        Authorization: `Bearer ${SUPABASE_KEY}`
       },
       body: JSON.stringify({
         p_telegram_id: user.id,
@@ -55,8 +58,7 @@ async function registerUser(user) {
   );
 
   if (!response.ok) {
-    const error = await response.text();
-    throw new Error(`Supabase error: ${error}`);
+    throw new Error(`Supabase error: ${await response.text()}`);
   }
 }
 
@@ -65,9 +67,12 @@ function getInstagramType(url) {
     const parsed = new URL(url);
     const host = parsed.hostname.toLowerCase();
 
-    if (
-      !["instagram.com", "www.instagram.com", "instagr.am", "www.instagr.am"].includes(host)
-    ) {
+    if (![
+      "instagram.com",
+      "www.instagram.com",
+      "instagr.am",
+      "www.instagr.am"
+    ].includes(host)) {
       return null;
     }
 
@@ -84,9 +89,63 @@ function getInstagramType(url) {
   }
 }
 
+async function downloadReel(instagramUrl) {
+  if (!RAPIDAPI_KEY) {
+    throw new Error("RAPIDAPI_KEY is missing");
+  }
+
+  const apiUrl = new URL(
+    `https://${RAPIDAPI_HOST}/download`
+  );
+
+  apiUrl.searchParams.set("url", instagramUrl);
+
+  const response = await fetch(apiUrl, {
+    method: "GET",
+    headers: {
+      "x-rapidapi-host": RAPIDAPI_HOST,
+      "x-rapidapi-key": RAPIDAPI_KEY
+    }
+  });
+
+  const result = await response.json();
+
+  if (!response.ok || result.error || result.success === false) {
+    throw new Error(
+      result.message || "Instagram download API failed"
+    );
+  }
+
+  const medias = result.data?.medias || [];
+
+  const video = medias.find(
+    media => media.type === "video" && media.url
+  );
+
+  if (!video) {
+    throw new Error("Видео в ответе API найдено не было");
+  }
+
+  return {
+    videoUrl: video.url,
+    title: result.data?.title || "Instagram Reel",
+    author: result.data?.author || ""
+  };
+}
+
+async function sendVideo(chatId, videoUrl) {
+  return telegram("sendVideo", {
+    chat_id: chatId,
+    video: videoUrl,
+    supports_streaming: true,
+    caption: "✅ Видео успешно загружено через InstaFlow!"
+  });
+}
+
 function isInstagramUrl(text) {
   try {
     const url = new URL(text);
+
     return [
       "instagram.com",
       "www.instagram.com",
@@ -133,8 +192,8 @@ export default async function handler(req, res) {
       await sendMessage(
         chatId,
         "👋 <b>Добро пожаловать в InstaFlow!</b>\n\n" +
-        "📥 Отправь ссылку на Instagram Reels, публикацию или Stories.\n\n" +
-        "Бот проверит ссылку и подготовит её к обработке.\n\n" +
+        "📥 Отправь ссылку на Instagram Reels.\n\n" +
+        "Бот загрузит доступное видео и отправит его сюда.\n\n" +
         "Используй /help для помощи."
       );
 
@@ -145,34 +204,40 @@ export default async function handler(req, res) {
       await sendMessage(
         chatId,
         "📖 <b>Как пользоваться InstaFlow</b>\n\n" +
-        "1. Открой доступную публикацию Instagram.\n" +
+        "1. Открой доступный Instagram Reel.\n" +
         "2. Скопируй ссылку.\n" +
-        "3. Отправь её сюда.\n\n" +
-        "Поддерживаемые типы ссылок: Reels, Posts и доступные Stories."
+        "3. Отправь её боту.\n\n" +
+        "Сейчас подключена загрузка Reels."
       );
 
       return res.status(200).json({ ok: true });
     }
 
-    if (isInstagramUrl(text)) {
-      const type = getInstagramType(text);
-
-      if (!type) {
-        await sendMessage(
-          chatId,
-          "⚠️ Не удалось определить тип публикации.\n\n" +
-          "Отправь ссылку на Reels, Post или Stories."
-        );
-
-        return res.status(200).json({ ok: true });
-      }
-
+    if (!isInstagramUrl(text)) {
       await sendMessage(
         chatId,
-        `✅ Ссылка принята!\n\n` +
-        `📁 Тип: <b>${type}</b>\n\n` +
-        "⚠️ Модуль загрузки ещё не подключён. Ссылка проверена, но видео пока не скачивается.\n\n" +
-        "Закрытый или недоступный контент обработать нельзя."
+        "📥 Отправь корректную ссылку Instagram."
+      );
+
+      return res.status(200).json({ ok: true });
+    }
+
+    const type = getInstagramType(text);
+
+    if (!type) {
+      await sendMessage(
+        chatId,
+        "⚠️ Не удалось определить тип публикации."
+      );
+
+      return res.status(200).json({ ok: true });
+    }
+
+    if (type !== "Reels") {
+      await sendMessage(
+        chatId,
+        "⚠️ Сейчас поддерживаются только Instagram Reels.\n\n" +
+        "Поддержка Posts и Stories будет добавлена отдельно."
       );
 
       return res.status(200).json({ ok: true });
@@ -180,13 +245,36 @@ export default async function handler(req, res) {
 
     await sendMessage(
       chatId,
-      "📥 Отправь ссылку Instagram, чтобы начать."
+      "⏳ <b>Загружаю видео...</b>\n\nПожалуйста, подожди."
     );
 
-    return res.status(200).json({ ok: true });
+    const result = await downloadReel(text);
+
+    await sendVideo(chatId, result.videoUrl);
+
+    return res.status(200).json({
+      ok: true,
+      downloaded: true
+    });
 
   } catch (error) {
     console.error("Webhook error:", error);
+
+    try {
+      const chatId =
+        req.body?.message?.chat?.id ||
+        req.body?.edited_message?.chat?.id;
+
+      if (chatId) {
+        await sendMessage(
+          chatId,
+          "❌ Не удалось загрузить видео.\n\n" +
+          "Возможно, ссылка недоступна или API временно не работает."
+        );
+      }
+    } catch (sendError) {
+      console.error("Telegram error:", sendError);
+    }
 
     return res.status(200).json({
       ok: true,
