@@ -1,10 +1,19 @@
-
 const TOKEN = process.env.BOT_TOKEN;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const RAPIDAPI_KEY = process.env.RAPIDAPI_KEY;
+const RAPIDAPI_KEY = process.env.RAPIDAPI_KEY; // теперь необязательный: используется только как запасной вариант
 
 const RAPIDAPI_HOST = "instagram-reels-downloader-api.p.rapidapi.com";
+
+const INSTAGRAM_HOSTS = [
+  "instagram.com",
+  "www.instagram.com",
+  "m.instagram.com",
+  "instagr.am",
+  "www.instagr.am"
+];
+
+// ---------- Telegram ----------
 
 async function telegram(method, body) {
   const response = await fetch(
@@ -34,6 +43,17 @@ async function sendMessage(chatId, text) {
   });
 }
 
+async function sendVideo(chatId, videoUrl) {
+  return telegram("sendVideo", {
+    chat_id: chatId,
+    video: videoUrl,
+    supports_streaming: true,
+    caption: "✅ Видео успешно загружено через InstaFlow!"
+  });
+}
+
+// ---------- Supabase ----------
+
 async function registerUser(user) {
   if (!SUPABASE_URL || !SUPABASE_KEY || !user?.id) {
     throw new Error("Supabase configuration is missing");
@@ -62,23 +82,25 @@ async function registerUser(user) {
   }
 }
 
+// ---------- Ссылки Instagram ----------
+
+function isInstagramUrl(text) {
+  try {
+    const url = new URL(text);
+    return INSTAGRAM_HOSTS.includes(url.hostname.toLowerCase());
+  } catch {
+    return false;
+  }
+}
+
 function getInstagramType(url) {
   try {
     const parsed = new URL(url);
-    const host = parsed.hostname.toLowerCase();
-
-    if (![
-      "instagram.com",
-      "www.instagram.com",
-      "instagr.am",
-      "www.instagr.am"
-    ].includes(host)) {
-      return null;
-    }
+    if (!INSTAGRAM_HOSTS.includes(parsed.hostname.toLowerCase())) return null;
 
     const path = parsed.pathname;
 
-    if (/\/reel\//i.test(path)) return "Reels";
+    if (/\/reels?\//i.test(path)) return "Reels";
     if (/\/p\//i.test(path)) return "Posts";
     if (/\/stories\//i.test(path)) return "Stories";
     if (/\/tv\//i.test(path)) return "Instagram videos";
@@ -89,15 +111,89 @@ function getInstagramType(url) {
   }
 }
 
-async function downloadReel(instagramUrl) {
+function getShortcode(url) {
+  const match = new URL(url).pathname.match(
+    /\/(?:reels?|p|tv)\/([A-Za-z0-9_-]+)/i
+  );
+  return match ? match[1] : null;
+}
+
+// ---------- Способ 1: напрямую через Instagram (бесплатно, без лимита API) ----------
+
+async function downloadDirect(instagramUrl) {
+  const shortcode = getShortcode(instagramUrl);
+  if (!shortcode) throw new Error("Не удалось получить shortcode из ссылки");
+
+  const lsd = "AVqbxe3J_YA";
+
+  const body = new URLSearchParams({
+    av: "0",
+    __d: "www",
+    __user: "0",
+    __a: "1",
+    __req: "3",
+    dpr: "2",
+    __ccg: "UNKNOWN",
+    lsd,
+    jazoest: "2957",
+    fb_api_caller_class: "RelayModern",
+    fb_api_req_friendly_name: "PolarisPostActionLoadPostQueryQuery",
+    variables: JSON.stringify({
+      shortcode,
+      fetch_tagged_user_count: null,
+      hoisted_comment_id: null,
+      hoisted_reply_id: null
+    }),
+    server_timestamps: "true",
+    // Если Instagram однажды поменяет doc_id, способ 1 перестанет работать,
+    // и бот автоматически перейдёт на RapidAPI (способ 2).
+    doc_id: "8845758582119845"
+  });
+
+  const response = await fetch("https://www.instagram.com/graphql/query", {
+    method: "POST",
+    headers: {
+      "User-Agent":
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+      "Content-Type": "application/x-www-form-urlencoded",
+      "X-IG-App-ID": "936619743392459",
+      "X-FB-LSD": lsd,
+      "X-ASBD-ID": "129477",
+      "Sec-Fetch-Site": "same-origin",
+      Referer: `https://www.instagram.com/reel/${shortcode}/`,
+      Origin: "https://www.instagram.com"
+    },
+    body
+  });
+
+  if (!response.ok) {
+    throw new Error(`Instagram ответил статусом ${response.status}`);
+  }
+
+  const json = await response.json();
+  const media = json?.data?.xdt_shortcode_media;
+
+  if (!media) throw new Error("Instagram не вернул данные о публикации");
+  if (!media.is_video || !media.video_url) {
+    throw new Error("В публикации нет видео");
+  }
+
+  return {
+    videoUrl: media.video_url,
+    title: media.edge_media_to_caption?.edges?.[0]?.node?.text || "Instagram Reel",
+    author: media.owner?.username || ""
+  };
+}
+
+// ---------- Способ 2: RapidAPI (запасной, с лимитом тарифа) ----------
+
+async function downloadViaRapidApi(instagramUrl) {
   if (!RAPIDAPI_KEY) {
     throw new Error("RAPIDAPI_KEY is missing");
   }
 
-  const apiUrl = new URL(
-    `https://${RAPIDAPI_HOST}/download`
-  );
-
+  const apiUrl = new URL(`https://${RAPIDAPI_HOST}/download`);
   apiUrl.searchParams.set("url", instagramUrl);
 
   const response = await fetch(apiUrl, {
@@ -111,16 +207,11 @@ async function downloadReel(instagramUrl) {
   const result = await response.json();
 
   if (!response.ok || result.error || result.success === false) {
-    throw new Error(
-      result.message || "Instagram download API failed"
-    );
+    throw new Error(result.message || "Instagram download API failed");
   }
 
   const medias = result.data?.medias || [];
-
-  const video = medias.find(
-    media => media.type === "video" && media.url
-  );
+  const video = medias.find(m => m.type === "video" && m.url);
 
   if (!video) {
     throw new Error("Видео в ответе API найдено не было");
@@ -133,29 +224,20 @@ async function downloadReel(instagramUrl) {
   };
 }
 
-async function sendVideo(chatId, videoUrl) {
-  return telegram("sendVideo", {
-    chat_id: chatId,
-    video: videoUrl,
-    supports_streaming: true,
-    caption: "✅ Видео успешно загружено через InstaFlow!"
-  });
-}
-
-function isInstagramUrl(text) {
+// Сначала бесплатный способ, при ошибке — RapidAPI
+async function downloadReel(instagramUrl) {
   try {
-    const url = new URL(text);
+    return await downloadDirect(instagramUrl);
+  } catch (directError) {
+    console.warn("Direct download failed:", directError.message);
 
-    return [
-      "instagram.com",
-      "www.instagram.com",
-      "instagr.am",
-      "www.instagr.am"
-    ].includes(url.hostname.toLowerCase());
-  } catch {
-    return false;
+    if (!RAPIDAPI_KEY) throw directError;
+
+    return await downloadViaRapidApi(instagramUrl);
   }
 }
+
+// ---------- Webhook ----------
 
 export default async function handler(req, res) {
   if (req.method !== "POST") {
@@ -185,7 +267,12 @@ export default async function handler(req, res) {
     const text = (message.text || "").trim();
 
     if (user) {
-      await registerUser(user);
+      try {
+        await registerUser(user);
+      } catch (e) {
+        // ошибка базы не должна мешать скачиванию
+        console.error("registerUser failed:", e.message);
+      }
     }
 
     if (text === "/start") {
@@ -196,7 +283,6 @@ export default async function handler(req, res) {
         "Бот загрузит доступное видео и отправит его сюда.\n\n" +
         "Используй /help для помощи."
       );
-
       return res.status(200).json({ ok: true });
     }
 
@@ -209,37 +295,27 @@ export default async function handler(req, res) {
         "3. Отправь её боту.\n\n" +
         "Сейчас подключена загрузка Reels."
       );
-
       return res.status(200).json({ ok: true });
     }
 
     if (!isInstagramUrl(text)) {
-      await sendMessage(
-        chatId,
-        "📥 Отправь корректную ссылку Instagram."
-      );
-
+      await sendMessage(chatId, "📥 Отправь корректную ссылку Instagram.");
       return res.status(200).json({ ok: true });
     }
 
     const type = getInstagramType(text);
 
     if (!type) {
-      await sendMessage(
-        chatId,
-        "⚠️ Не удалось определить тип публикации."
-      );
-
+      await sendMessage(chatId, "⚠️ Не удалось определить тип публикации.");
       return res.status(200).json({ ok: true });
     }
 
-    if (type !== "Reels") {
+    if (type !== "Reels" && type !== "Posts" && type !== "Instagram videos") {
       await sendMessage(
         chatId,
-        "⚠️ Сейчас поддерживаются только Instagram Reels.\n\n" +
-        "Поддержка Posts и Stories будет добавлена отдельно."
+        "⚠️ Сейчас поддерживаются только видео (Reels и видео-посты).\n\n" +
+        "Поддержка Stories будет добавлена отдельно."
       );
-
       return res.status(200).json({ ok: true });
     }
 
@@ -252,10 +328,7 @@ export default async function handler(req, res) {
 
     await sendVideo(chatId, result.videoUrl);
 
-    return res.status(200).json({
-      ok: true,
-      downloaded: true
-    });
+    return res.status(200).json({ ok: true, downloaded: true });
 
   } catch (error) {
     console.error("Webhook error:", error);
@@ -269,16 +342,13 @@ export default async function handler(req, res) {
         await sendMessage(
           chatId,
           "❌ Не удалось загрузить видео.\n\n" +
-          "Возможно, ссылка недоступна или API временно не работает."
+          "Возможно, аккаунт закрытый, ссылка недоступна или Instagram временно ограничил запросы. Попробуй ещё раз через минуту."
         );
       }
     } catch (sendError) {
       console.error("Telegram error:", sendError);
     }
 
-    return res.status(200).json({
-      ok: true,
-      error: error.message
-    });
+    return res.status(200).json({ ok: true, error: error.message });
   }
 }
